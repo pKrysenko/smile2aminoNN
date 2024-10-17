@@ -1,0 +1,35 @@
+pathes:
+  csv_path: "database_for_NN_on_entropy_SHORT_.csv"
+  model_dir: "model/"
+
+
+preprocessing:
+  input_vocab_size: 61
+  input_column: "SMILES_string"
+  output_column: "amino_sequence"
+  max_len: 500
+
+
+model:
+  model_name: "transformer"
+  d_model: 32
+  num_heads: 4
+  dff: 32
+  num_layers: 4
+  dropout_rate: 0.1
+
+  input_vocab_size: ${preprocessing.input_vocab_size}
+  max_len: ${preprocessing.max_len}
+
+optimizer:
+  lr: 1e-3
+
+train:
+  epochs: 50
+  batch_size: 4
+
+
+hydra:
+  run:
+    dir: outputs/${model.model_name}_d${model.d_model}_dff${model.dff}_n${model.num_layers}_dr${model.dropout_rate}/${now:%Y-%m-%d_%H-%M-%S}
+
