@@ -1,6 +1,7 @@
 import os
 
 import hydra
+import pandas as pd
 
 import tensorflow as tf
 import numpy as np
@@ -89,11 +90,18 @@ def app(cfg):
         optimizer=optimizer,
         metrics=[masked_accuracy])
 
-    model.fit((X_train, A_train), y_train,
+    history = model.fit((X_train, A_train), y_train,
               epochs=cfg.train.epochs,
               batch_size=cfg.train.batch_size,
               validation_data=((X_val, A_val), y_val),
               callbacks=[model_checkpoint_cb])
+
+    df_metrics = pd.DataFrame(columns=list(history.history.keys()))
+    for k, v in history.history.items():
+        df_metrics[k] = v
+
+    path_to_save_csv = os.path.join(output_dir, "metrics_per_epoch.csv")
+    df_metrics.to_csv(path_to_save_csv, index=False)
 
     model.load_weights(checkpoint_filepath)
     predictor = TransformerPredictor(
