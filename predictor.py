@@ -1,6 +1,8 @@
 import numpy as np
 import tensorflow as tf
 
+from tqdm import tqdm
+
 
 class TransformerPredictor(tf.Module):
     def __init__(self, sp_input, sp_output, transformer):
@@ -19,7 +21,7 @@ class TransformerPredictor(tf.Module):
         end = self.sp_output.eos_id()
 
         output_array = [start]
-        for i in tf.range(max_length):
+        for i in tqdm(tf.range(max_length)):
             output = np.expand_dims(np.array(output_array), axis=0)
             predictions = self.transformer((sentence, output), training=False)
 
