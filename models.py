@@ -304,3 +304,56 @@ class Transformer(tf.keras.Model):
     final_output = self.final_layer(dec_output)
 
     return final_output
+
+  class TransformerProbs(tf.keras.Model):
+      def __init__(self,
+                   *,
+                   num_layers,
+                   d_model,
+                   num_attention_heads,
+                   dff,
+                   max_len,
+                   first_vocab_size,
+                   second_vocab_size,
+                   gru_hidden=64,
+                   dropout_rate=0.1
+                   ):
+          super().__init__()
+
+          self.encoder = Encoder(
+              num_layers=num_layers,
+              d_model=d_model,
+              num_attention_heads=num_attention_heads,
+              dff=dff,
+              input_vocab_size=first_vocab_size,
+              dropout_rate=dropout_rate,
+              max_len=max_len
+          )
+
+          self.decoder = Decoder(
+              num_layers=num_layers,
+              d_model=d_model,
+              num_attention_heads=num_attention_heads,
+              dff=dff,
+              max_len=max_len,
+              target_vocab_size=second_vocab_size,
+              dropout_rate=dropout_rate
+          )
+
+          self.gru = tf.keras.layers.GRU(gru_hidden)
+          self.prob_layer = tf.keras.layers.Dense(1)
+
+      def call(self, inputs, training=False):
+          inp, tar = inputs
+
+          enc_output = self.encoder(inp, training=training)
+          enc_mask = self.encoder.compute_mask(inp)
+
+          dec_output, attention_weights = self.decoder(
+              tar, enc_output, enc_mask, training=training)
+
+          final_emb = self.gru_layer(dec_output)
+          prob = self.prob_layer(final_emb)
+
+
+          return prob
