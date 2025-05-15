@@ -4,7 +4,7 @@ import tensorflow as tf
 from omegaconf import OmegaConf
 import sentencepiece as spm
 
-from model import Transformer
+from models import Transformer
 from predictor import TransformerPredictor
 
 

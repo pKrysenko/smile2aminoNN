@@ -17,8 +17,8 @@ from predictor import TransformerPredictor
 import logging
 log = logging.getLogger(__name__)
 
-np.random.seed(42)
-tf.random.set_seed(42)
+np.random.seed(128)
+tf.random.set_seed(128)
 
 
 def masked_loss(label, pred):
@@ -54,54 +54,56 @@ def app(cfg):
 
     dataloader = DataLoaderProbaility(csv_path=cfg.pathes.csv_path,
                             vocab_size=cfg.preprocessing.input_vocab_size,
-                            max_len=cfg.preprocessing.max_len,
+                            max_len_f=cfg.preprocessing.max_len_f,
+                            max_len_s=cfg.preprocessing.max_len_f,
                             first_chemical=cfg.preprocessing.first_column,
                             second_chemical=cfg.preprocessing.second_column,
                             output=cfg.preprocessing.output)
 
-    f_inputs, s_inputs, probs, (prob_min, prob_max) = dataloader.pipeline()
+    (e_first_train, e_second_train, score_train), (e_first_val, e_second_val, score_val), df_train, df_val = dataloader.pipeline()
+    print(e_first_train.shape)
 
-    f_train, f_val, s_train, s_val, prob_train, prob_val = train_test_split(f_inputs, s_inputs, probs,
-                                                                      test_size=0.2, random_state=42)
-
-    log.info(f"Prob min: {prob_min} | prob max: {prob_max}")
+    #log.info(f"Prob min: {prob_min} | prob max: {prob_max}")
 
     model = models.TransformerProbs(num_layers=cfg.model.num_layers,
                         d_model=cfg.model.d_model,
-                        num_attention_heads=cfg.model.num_heads,
+                        num_heads=cfg.model.num_heads,
                         dff=cfg.model.dff,
-                        max_len=cfg.model.max_len,
-                        first_vocab_size=cfg.model.input_vocab_size,
-                        second_vocab_size=cfg.model.input_vocab_size,
-                        dropout_rate=cfg.model.dropout_rate)
+                        f_vocab_size=cfg.model.input_vocab_size,
+                        s_vocab_size=cfg.model.input_vocab_size,
+                        dropout_rate=cfg.model.dropout_rate,
+                        gru_hidden=cfg.model.gru_hidden)
 
-    model((np.random.randn(1, cfg.model.max_len), np.random.randn(1, cfg.model.max_len)))
+    model((np.random.randn(1, cfg.model.max_len_f), np.random.randn(1, cfg.model.max_len_s)))
     model.summary()
 
-    optimizer = tf.keras.optimizers.Adam(cfg.optimizer.lr, beta_1=0.9, beta_2=0.98,
-                                         epsilon=1e-9)
+    optimizer = tf.keras.optimizers.Adam(cfg.optimizer.lr)
+
 
 
     checkpoint_filepath = os.path.join(output_dir, "model", "best_model", "model.weights.h5")
 
     model_checkpoint_cb = tf.keras.callbacks.ModelCheckpoint(
         filepath=checkpoint_filepath,
-        monitor='val_mean_squared_error',
-        mode='min',
+        monitor='val_accuracy',
+        mode='max',
         verbose=1,
         save_best_only=True,
         save_weights_only=True)
 
     model.compile(
-        loss=tf.keras.losses.MSE,
+        loss='bce',
         optimizer=optimizer,
-        metrics=[tf.keras.losses.MSE])
+        metrics=['accuracy', 'recall', 'precision'])
 
-    history = model.fit((f_train, s_train), prob_train,
+    history = model.fit((e_first_train, e_second_train), score_train,
               epochs=cfg.train.epochs,
               batch_size=cfg.train.batch_size,
-              validation_data=((f_val, s_val), prob_val),
+              validation_data=((e_first_val, e_second_val), score_val),
               callbacks=[model_checkpoint_cb])
+    
+    df_train.to_csv(os.path.join(output_dir, "train_data.csv"), header=True, index=False)
+    df_val.to_csv(os.path.join(output_dir, "val_data.csv"), header=True, index=False)
 
     df_metrics = pd.DataFrame(columns=list(history.history.keys()))
     for k, v in history.history.items():
@@ -110,8 +112,8 @@ def app(cfg):
 
     path_to_save_csv = os.path.join(output_dir, "metrics_per_epoch.csv")
     df_metrics.to_csv(path_to_save_csv, index=False)
-    with open(os.path.join(output_dir, "scaler_prob.json"), 'w') as f:
-        f.write(json.dumps({"min": float(prob_min), "max": float(prob_max)}))
+    #with open(os.path.join(output_dir, "scaler_prob.json"), 'w') as f:
+    #    f.write(json.dumps({"min": float(prob_min), "max": float(prob_max)}))
     model.load_weights(checkpoint_filepath)
     """
     predictor = TransformerPredictor(

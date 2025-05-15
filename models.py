@@ -7,16 +7,18 @@ def get_angles(pos, i, d_model):
   return pos * angle_rates
 
 
-def positional_encoding(position, d_model):
-  angle_rads = get_angles(np.arange(position)[:, np.newaxis],
-                          np.arange(d_model)[np.newaxis, :],
-                          d_model)
+def positional_encoding(length, depth):
+  depth = depth/2
 
-  angle_rads[:, 0::2] = np.sin(angle_rads[:, 0::2])
+  positions = np.arange(length)[:, np.newaxis]     # (seq, 1)
+  depths = np.arange(depth)[np.newaxis, :]/depth   # (1, depth)
 
-  angle_rads[:, 1::2] = np.cos(angle_rads[:, 1::2])
+  angle_rates = 1 / (10000**depths)         # (1, depth)
+  angle_rads = positions * angle_rates      # (pos, depth)
 
-  pos_encoding = angle_rads[np.newaxis, ...]
+  pos_encoding = np.concatenate(
+      [np.sin(angle_rads), np.cos(angle_rads)],
+      axis=-1) 
 
   return tf.cast(pos_encoding, dtype=tf.float32)
 
@@ -30,230 +32,187 @@ def point_wise_feed_forward_network(
       tf.keras.layers.Dense(d_model)  # Shape `(batch_size, seq_len, d_model)`.
   ])
 
-class EncoderLayer(tf.keras.layers.Layer):
-  def __init__(self,*,
-               d_model,
-               num_attention_heads,
-               dff,
-               dropout_rate=0.1
-               ):
-    super(EncoderLayer, self).__init__()
+
+class PositionalEmbedding(tf.keras.layers.Layer):
+  def __init__(self, vocab_size, d_model):
+    super().__init__()
+    self.d_model = d_model
+    self.embedding = tf.keras.layers.Embedding(vocab_size, d_model, mask_zero=True) 
+    self.pos_encoding = positional_encoding(length=2048, depth=d_model)
+
+  def compute_mask(self, *args, **kwargs):
+    return self.embedding.compute_mask(*args, **kwargs)
+
+  def call(self, x):
+    length = tf.shape(x)[1]
+    x = self.embedding(x)
+    # This factor sets the relative scale of the embedding and positonal_encoding.
+    x *= tf.math.sqrt(tf.cast(self.d_model, tf.float32))
+    x = x + self.pos_encoding[tf.newaxis, :length, :]
+    return x
+
+class BaseAttention(tf.keras.layers.Layer):
+  def __init__(self, **kwargs):
+    super().__init__()
+    self.mha = tf.keras.layers.MultiHeadAttention(**kwargs)
+    self.layernorm = tf.keras.layers.LayerNormalization()
+    self.add = tf.keras.layers.Add()
+
+class CrossAttention(BaseAttention):
+  def call(self, x, context):
+    attn_output, attn_scores = self.mha(
+        query=x,
+        key=context,
+        value=context,
+        return_attention_scores=True)
+
+    # Cache the attention scores for plotting later.
+    self.last_attn_scores = attn_scores
+
+    x = self.add([x, attn_output])
+    x = self.layernorm(x)
+
+    return x
 
 
-
-    self.mha = tf.keras.layers.MultiHeadAttention(
-        num_heads=num_attention_heads,
-        key_dim=d_model,
-        dropout=dropout_rate,
-        )
-
-    self.ffn = point_wise_feed_forward_network(d_model, dff)
-
-    self.layernorm1 = tf.keras.layers.LayerNormalization(epsilon=1e-6)
-    self.layernorm2 = tf.keras.layers.LayerNormalization(epsilon=1e-6)
-
-    self.dropout1 = tf.keras.layers.Dropout(dropout_rate)
-
-  def call(self, x, training, mask):
-
-    if mask is not None:
-      mask1 = mask[:, :, None]
-      mask2 = mask[:, None, :]
-      attention_mask = mask1 & mask2
-    else:
-      attention_mask = None
-
+class GlobalSelfAttention(BaseAttention):
+  def call(self, x):
     attn_output = self.mha(
         query=x,
         value=x,
-        key=x,
-        attention_mask=attention_mask,
-        training=training,
-        )
+        key=x)
+    x = self.add([x, attn_output])
+    x = self.layernorm(x)
+    return x
 
-    out1 = self.layernorm1(x + attn_output)
 
-    ffn_output = self.ffn(out1)
-    ffn_output = self.dropout1(ffn_output, training=training)
-    out2 = self.layernorm2(out1 + ffn_output)
+class FeedForward(tf.keras.layers.Layer):
+  def __init__(self, d_model, dff, dropout_rate=0.1):
+    super().__init__()
+    self.seq = tf.keras.Sequential([
+      tf.keras.layers.Dense(dff, activation='relu'),
+      tf.keras.layers.Dense(d_model),
+      tf.keras.layers.Dropout(dropout_rate)
+    ])
+    self.add = tf.keras.layers.Add()
+    self.layer_norm = tf.keras.layers.LayerNormalization()
 
-    return out2
+  def call(self, x):
+    x = self.add([x, self.seq(x)])
+    x = self.layer_norm(x) 
+    return x
+
+
+class EncoderLayer(tf.keras.layers.Layer):
+  def __init__(self,*, d_model, num_heads, dff, dropout_rate=0.1):
+    super().__init__()
+
+    self.self_attention = GlobalSelfAttention(
+        num_heads=num_heads,
+        key_dim=d_model,
+        dropout=dropout_rate)
+
+    self.ffn = FeedForward(d_model, dff)
+
+  def call(self, x):
+    x = self.self_attention(x)
+    x = self.ffn(x)
+    return x
 
 class Encoder(tf.keras.layers.Layer):
-  def __init__(self,
-               *,
-               num_layers,
-               d_model,
-               num_attention_heads,
-               dff,
-               max_len,
-               input_vocab_size,
-               dropout_rate=0.1,
-               ):
-    super(Encoder, self).__init__()
+  def __init__(self, *, num_layers, d_model, num_heads,
+               dff, vocab_size, dropout_rate=0.1):
+    super().__init__()
 
     self.d_model = d_model
     self.num_layers = num_layers
 
-    self.embedding = tf.keras.layers.Embedding(input_vocab_size, d_model, mask_zero=True)
-    self.pos_encoding = positional_encoding(max_len, self.d_model)
+    self.pos_embedding = PositionalEmbedding(
+        vocab_size=vocab_size, d_model=d_model)
 
     self.enc_layers = [
-        EncoderLayer(
-          d_model=d_model,
-          num_attention_heads=num_attention_heads,
-          dff=dff,
-          dropout_rate=dropout_rate)
+        EncoderLayer(d_model=d_model,
+                     num_heads=num_heads,
+                     dff=dff,
+                     dropout_rate=dropout_rate)
         for _ in range(num_layers)]
-
     self.dropout = tf.keras.layers.Dropout(dropout_rate)
 
-  # Masking.
-  def compute_mask(self, x, previous_mask=None):
-    return self.embedding.compute_mask(x, previous_mask)
+  def call(self, x):
+    # `x` is token-IDs shape: (batch, seq_len)
+    x = self.pos_embedding(x)  # Shape `(batch_size, seq_len, d_model)`.
 
-  def call(self, x, training):
-
-    seq_len = tf.shape(x)[1]
-
-    mask = self.compute_mask(x)
-    x = self.embedding(x)
-    x *= tf.math.sqrt(tf.cast(self.d_model, tf.float32))
-    x += self.pos_encoding[:, :seq_len, :]
-    x = self.dropout(x, training=training)
-
+    # Add dropout.
+    x = self.dropout(x)
 
     for i in range(self.num_layers):
-      x = self.enc_layers[i](x, training=training, mask=mask)
+      x = self.enc_layers[i](x)
 
-    return x
+    return x  # Shape `(batch_size, seq_len, d_model)`.
 
 
 class DecoderLayer(tf.keras.layers.Layer):
   def __init__(self,
                *,
                d_model,
-               num_attention_heads,
+               num_heads,
                dff,
-               dropout_rate=0.1
-               ):
+               dropout_rate=0.1):
     super(DecoderLayer, self).__init__()
 
-    self.mha_masked = tf.keras.layers.MultiHeadAttention(
-        num_heads=num_attention_heads,
+    self.global_self_attention = GlobalSelfAttention(
+        num_heads=num_heads,
         key_dim=d_model,
-        dropout=dropout_rate
-    )
+        dropout=dropout_rate)
 
-    self.mha_cross = tf.keras.layers.MultiHeadAttention(
-        num_heads=num_attention_heads,
+    self.cross_attention = CrossAttention(
+        num_heads=num_heads,
         key_dim=d_model,
-        dropout=dropout_rate
-    )
+        dropout=dropout_rate)
 
-    self.ffn = point_wise_feed_forward_network(d_model, dff)
+    self.ffn = FeedForward(d_model, dff)
 
-    self.layernorm1 = tf.keras.layers.LayerNormalization(epsilon=1e-6)
-    self.layernorm2 = tf.keras.layers.LayerNormalization(epsilon=1e-6)
-    self.layernorm3 = tf.keras.layers.LayerNormalization(epsilon=1e-6)
+  def call(self, x, context):
+    x = self.global_self_attention(x=x)
+    x = self.cross_attention(x=x, context=context)
 
-    self.dropout1 = tf.keras.layers.Dropout(dropout_rate)
+    # Cache the last attention scores for plotting later
+    self.last_attn_scores = self.cross_attention.last_attn_scores
 
-  def call(self, x, mask, enc_output, enc_mask, training):
-
-    self_attention_mask = None
-    if mask is not None:
-      mask1 = mask[:, :, None]
-      mask2 = mask[:, None, :]
-      self_attention_mask = mask1 & mask2
-
-    attn_masked, attn_weights_masked = self.mha_masked(
-        query=x,
-        value=x,
-        key=x,
-        attention_mask=self_attention_mask,
-        use_causal_mask=True,
-        return_attention_scores=True,
-        training=training
-        )
-
-    out1 = self.layernorm1(attn_masked + x)
-
-    attention_mask = None
-    if mask is not None and enc_mask is not None:
-      mask1 = mask[:, :, None]
-      mask2 = enc_mask[:, None, :]
-      attention_mask = mask1 & mask2
-
-    attn_cross, attn_weights_cross = self.mha_cross(
-        query=out1,
-        value=enc_output,
-        key=enc_output,
-        attention_mask=attention_mask,
-        return_attention_scores=True,
-        training=training
-    )
-
-    out2 = self.layernorm2(attn_cross + out1)
-
-    ffn_output = self.ffn(out2)
-    ffn_output = self.dropout1(ffn_output, training=training)
-    out3 = self.layernorm3(ffn_output + out2)
-
-    return out3, attn_weights_masked, attn_weights_cross
+    x = self.ffn(x)  # Shape `(batch_size, seq_len, d_model)`.
+    return x
 
 class Decoder(tf.keras.layers.Layer):
-  def __init__(self,
-               *,
-               num_layers,
-               d_model,
-               num_attention_heads,
-               dff,
-               max_len,
-               target_vocab_size,
-               dropout_rate=0.1
-               ):
+  def __init__(self, *, num_layers, d_model, num_heads, dff, vocab_size,
+               dropout_rate=0.1):
     super(Decoder, self).__init__()
 
     self.d_model = d_model
     self.num_layers = num_layers
 
-    self.embedding = tf.keras.layers.Embedding(
-      target_vocab_size,
-      d_model,
-      mask_zero=True
-      )
-    self.pos_encoding = positional_encoding(max_len, d_model)
-
-    self.dec_layers = [
-        DecoderLayer(
-          d_model=d_model,
-          num_attention_heads=num_attention_heads,
-          dff=dff,
-          dropout_rate=dropout_rate)
-        for _ in range(num_layers)
-        ]
+    self.pos_embedding = PositionalEmbedding(vocab_size=vocab_size,
+                                             d_model=d_model)
     self.dropout = tf.keras.layers.Dropout(dropout_rate)
+    self.dec_layers = [
+        DecoderLayer(d_model=d_model, num_heads=num_heads,
+                     dff=dff, dropout_rate=dropout_rate)
+        for _ in range(num_layers)]
 
-  def call(self, x, enc_output, enc_mask, training):
+    self.last_attn_scores = None
 
-    seq_len = tf.shape(x)[1]
-    attention_weights = {}
+  def call(self, x, context):
+    # `x` is token-IDs shape (batch, target_seq_len)
+    x = self.pos_embedding(x)  # (batch_size, target_seq_len, d_model)
 
-    mask = self.embedding.compute_mask(x)
-    x = self.embedding(x)
-    x *= tf.math.sqrt(tf.cast(self.d_model, tf.float32))
-    x += self.pos_encoding[:, :seq_len, :]
-
-    x = self.dropout(x, training=training)
+    x = self.dropout(x)
 
     for i in range(self.num_layers):
-      x, block1, block2  = self.dec_layers[i](x, mask=mask, enc_output=enc_output, enc_mask=enc_mask, training=training)
+      x  = self.dec_layers[i](x, context)
 
-      attention_weights[f'decoder_layer{i+1}_block1'] = block1
-      attention_weights[f'decoder_layer{i+1}_block2'] = block2
+    self.last_attn_scores = self.dec_layers[-1].last_attn_scores
 
-    return x, attention_weights
+    # The shape of x is (batch_size, target_seq_len, d_model).
+    return x
 
 
 class Transformer(tf.keras.Model):
@@ -266,7 +225,8 @@ class Transformer(tf.keras.Model):
                max_len,
                input_vocab_size,
                target_vocab_size,
-               dropout_rate=0.1
+               dropout_rate=0.1,
+               gru_unit=64,
                ):
     super().__init__()
 
@@ -305,55 +265,44 @@ class Transformer(tf.keras.Model):
 
     return final_output
 
-  class TransformerProbs(tf.keras.Model):
-      def __init__(self,
-                   *,
-                   num_layers,
-                   d_model,
-                   num_attention_heads,
-                   dff,
-                   max_len,
-                   first_vocab_size,
-                   second_vocab_size,
-                   gru_hidden=64,
-                   dropout_rate=0.1
-                   ):
-          super().__init__()
+class TransformerProbs(tf.keras.Model):
+  def __init__(self, *, num_layers, d_model, num_heads, dff,
+               f_vocab_size, s_vocab_size, gru_hidden, dropout_rate=0.1):
+    super().__init__()
+    self.encoder = Encoder(num_layers=num_layers, d_model=d_model,
+                           num_heads=num_heads, dff=dff,
+                           vocab_size=f_vocab_size,
+                           dropout_rate=dropout_rate)
 
-          self.encoder = Encoder(
-              num_layers=num_layers,
-              d_model=d_model,
-              num_attention_heads=num_attention_heads,
-              dff=dff,
-              input_vocab_size=first_vocab_size,
-              dropout_rate=dropout_rate,
-              max_len=max_len
-          )
+    self.decoder = Decoder(num_layers=num_layers, d_model=d_model,
+                           num_heads=num_heads, dff=dff,
+                           vocab_size=s_vocab_size,
+                           dropout_rate=dropout_rate)
 
-          self.decoder = Decoder(
-              num_layers=num_layers,
-              d_model=d_model,
-              num_attention_heads=num_attention_heads,
-              dff=dff,
-              max_len=max_len,
-              target_vocab_size=second_vocab_size,
-              dropout_rate=dropout_rate
-          )
+    self.GA = tf.keras.layers.GlobalAveragePooling1D(
+    data_format=None, keepdims=False,
+)
+    self.predict_score  = tf.keras.Sequential([
+    tf.keras.layers.Dense(512, activation=tf.keras.layers.LeakyReLU()),
+    tf.keras.layers.BatchNormalization(),
+    tf.keras.layers.Dense(256, activation=tf.keras.layers.LeakyReLU()),
+    tf.keras.layers.BatchNormalization(),
+    tf.keras.layers.Dense(128, activation=tf.keras.layers.LeakyReLU()),
+    tf.keras.layers.Dense(1, activation='sigmoid')
+])
 
-          self.gru = tf.keras.layers.GRU(gru_hidden)
-          self.prob_layer = tf.keras.layers.Dense(1)
+  def call(self, inputs):
+    # To use a Keras model with `.fit` you must pass all your inputs in the
+    # first argument.
+    context, x  = inputs
+    ga_mask = self.decoder.pos_embedding.compute_mask(x)
 
-      def call(self, inputs, training=False):
-          inp, tar = inputs
+    context = self.encoder(context)  # (batch_size, context_len, d_model)
 
-          enc_output = self.encoder(inp, training=training)
-          enc_mask = self.encoder.compute_mask(inp)
+    x = self.decoder(x, context)  # (batch_size, target_len, d_model)
 
-          dec_output, attention_weights = self.decoder(
-              tar, enc_output, enc_mask, training=training)
+    # Final linear layer output.
+    x = self.GA(x, mask=ga_mask)
+    score = self.predict_score(x)
 
-          final_emb = self.gru_layer(dec_output)
-          prob = self.prob_layer(final_emb)
-
-
-          return prob
+    return score
